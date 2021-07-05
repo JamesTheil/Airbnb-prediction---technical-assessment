@@ -1,0 +1,472 @@
+---
+title: "Predicting prices of Berlin Airbnb listings"
+output: html_notebook
+author: "James Theil"
+---
+# Load required packages
+```{r}
+library(pacman)
+
+p_load(tidyverse, magrittr, psych, mice,
+       nlme, stats, tidymodels, ranger)
+
+```
+
+# Reading data and inpspecting DV
+
+```{r}
+berlin_listings <- read_csv("http://data.insideairbnb.com/germany/be/berlin/2021-03-12/data/listings.csv.gz")
+
+# Inspect price as it is my DV
+
+head(berlin_listings$price, 20)
+
+# remove $ signs from prices
+berlin_listings$price = as.numeric(gsub("\\$", "", berlin_listings$price))
+
+# inspect distribution
+
+berlin_listings %>% 
+  ggplot(aes(x = price)) +
+  geom_histogram() +
+  theme_bw()
+
+# there are some extreme outliers- I will remove everything above 300
+
+berlin_listings %>% 
+  filter(price < 300) %>% 
+  ggplot(aes(x = price)) +
+  geom_histogram(binwidth = 5,colour="black", fill="grey") +
+  theme_bw()
+
+berlin_listings %<>% 
+  filter(price < 300)
+
+
+# Much better but will need to transform the data to remedy the skew
+
+berlin_listings %>% 
+ggplot(aes(x = price))+
+  geom_histogram(binwidth = 5,colour = "black", fill = "grey") +
+  theme_bw() +
+  labs(x = "Listing price",
+       Y = "count",
+       title = "Distribution of listing prices")
+
+ggsave("Distribution of listing prices.jpg")
+
+berlin_listings %>% 
+ggplot(aes(x = log(price)))+
+  geom_histogram(binwidth = .1, colour = "black", fill = "grey") +
+  theme_bw() +
+  labs(x = "Listing price",
+       Y = "count",
+       title = "Distribution of listing prices (log transformed)")
+
+ggsave("Distribution of listing prices (log transformed).jpg")
+
+
+berlin_listings %<>% 
+  mutate(price_log = log(price))
+
+
+
+```
+# smaller df with select variables
+```{r}
+# make a new df with select variables for analysis
+
+berlin_condensed <- berlin_listings %>%
+  select(price, host_response_time, bedrooms, review_scores_rating:review_scores_value,
+         property_type:beds, minimum_nights, price_log, number_of_reviews, neighbourhood_group_cleansed) %>% 
+   mutate(bathrooms = parse_number(bathrooms_text),
+          property_type = as.factor(property_type),
+          room_type = as.factor(room_type),
+          neighbourhood_group_cleansed = as.factor(neighbourhood_group_cleansed))
+
+```
+# Reduce the ratings into a summed rating 
+
+```{r}
+# In order to assess the the correlation between rating scores,
+# McDonald's omega estimates are calculated. This method uses a hierarchical factor anaylsis
+# to estimate correlation between the ratings. Note. I have selected only the original ratings as per 
+# airbnb's website for inclusion in the analysis
+
+
+berlin_condensed %>% 
+    select(review_scores_accuracy:review_scores_value) %>% 
+    omega(nfactors = 1)
+
+# As cleanliness and location have values lower than the rule of thumb (.70)
+# they will be excluded.
+
+berlin_condensed %>% 
+  select(review_scores_accuracy, review_scores_checkin,
+         review_scores_communication, review_scores_value) %>% 
+  omega(nfactors = 1)
+
+# These scores will be summed to create a single rating score
+
+berlin_condensed %<>% 
+  mutate(summed_rating = (review_scores_accuracy + review_scores_checkin +
+         review_scores_communication + review_scores_value)/4,
+         summed_rating = as.factor(round(summed_rating)))
+
+
+```
+# check how much missing data we have
+```{r}
+# as there is a lot of missing data, I will impute missing values using the mice package
+
+berlin_condensed %>% 
+  summarise_all(funs(sum(is.na(.))))
+
+
+# create succinct df
+
+berlin_temp <- berlin_condensed %>% 
+  select(price, bedrooms, property_type:bathrooms,
+         beds:price_log, summed_rating, neighbourhood_group_cleansed )
+
+# All missing values imputed using predictive mean matching
+
+berlin_impute <- mice(berlin_temp, m=5, meth = "pmm")
+
+berlin_condensed2 <- complete(berlin_impute, 1) # check that all is okay- yes
+
+berlin_condensed <- berlin_condensed2
+
+berlin_condensed %>% 
+  mutate(price_log = round(price_log, digits = 2))
+
+
+# there are a few listings with the price at zero I will remove these as the log transform is creating Inf's
+
+berlin_condensed %<>% 
+  filter(price > 0)
+
+# redo the transformation
+
+berlin_condensed %<>% 
+  mutate(price_log = log(price))
+
+```
+## Need to remove some weird listings
+
+```{r}
+
+# remove bathrooms that are greater than 4.5 (the majority of the data lie below this point)
+
+berlin_condensed %<>% 
+  filter(bathrooms < 4.5)
+
+# check - much better
+
+# berlin_condensed %>% 
+#   ggplot(aes(x = factor(bathrooms), y = price_log, fill  = factor(bathrooms))) +
+#   geom_boxplot(outlier.alpha = .5) +
+#   theme_bw() +
+#   labs(x = "Bathrooms",
+#        y = "Listing price",
+#        title = "The effect of the number of bathrooms on price")
+
+# there are many low-frequency obscure property types- these need to be removed
+
+berlin_condensed %<>% 
+  group_by(property_type) %>% 
+  mutate(freq = n()) %>% 
+  ungroup() %>% 
+  filter(freq > 100) %>%
+  select(-freq)
+
+
+```
+
+# Exploratory data analysis
+
+```{r}
+
+
+# boxplot of the effects of property type on price
+
+berlin_condensed %>% 
+  ggplot(aes(x = property_type, y = price_log, fill = property_type)) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) +
+  labs(x = "Property type",
+       y = "Listing price",
+       title = "The effect of property type on price",
+       fill = "Property type")
+
+ggsave("The effect of property type on price.jpg")
+  
+  
+# boxplot of the effects of number of occupants on price
+# as expected - the number of individuals accomodated has a positive effect on price
+
+berlin_condensed %>% 
+  ggplot(aes(x = factor(accommodates), y = price_log, fill = factor(accommodates))) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme_bw() +
+  labs(x = "Accommodates",
+       y = "Listing price",
+       title = "The effect of the number of occupants on price",
+       fill = "Accommodates")
+
+ggsave("The effect of the number of occupants on price.jpg")
+
+# boxplot of the effects of number of bathrooms on price
+
+berlin_condensed %>% 
+  ggplot(aes(x = factor(bathrooms), y = price_log, fill  = factor(bathrooms))) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme_bw() +
+  labs(x = "Bathrooms",
+       y = "Listing price",
+       title = "The effect of the number of bathrooms on price",
+       fill = "Number of bathrooms")
+
+ggsave("The effect of the number of bathrooms on price.jpg")
+
+
+# boxplot of the effects of the room type on price
+
+berlin_condensed %>% 
+  ggplot(aes(x = room_type, y = price_log, fill = room_type)) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) +
+  labs(x = "Room type",
+       y = "Listing price",
+       title = "The effect of the room type on price",
+       fill = "Room type")
+
+ggsave("The effect of the room type on price.jpg")
+
+# boxplot of the effects of the number of beds on price
+
+berlin_condensed %>% 
+  ggplot(aes(x = factor(beds), y = price_log, fill = factor(beds))) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme_bw() +
+  theme(legend.key.size = unit(.5, 'cm')) +
+  labs(x = "Number of beds",
+       y = "Listing price",
+       title = "The effect of the number of beds on price",
+       fill = "Number of beds")
+
+ggsave("The effect of the number of beds on price.jpg")
+
+
+# boxplot of the effects of the neighbourhood on price
+
+berlin_condensed %>% 
+  ggplot(aes(x = neighbourhood_group_cleansed, y = price_log, fill = neighbourhood_group_cleansed)) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) +
+  labs(x = "Neighbourhood",
+       y = "Listing price",
+       title = "The effect of the neighbourhood on price",
+       fill = "Grouped neighbourhoods")
+
+ggsave("The effect of the neighbourhood on price.jpg")
+
+berlin_condensed %>% 
+  ggplot(aes(x = minimum_nights, y = price_log)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Minimum nights",
+       y = "Listing price",
+       title = "The effect of the minimum stay on price") +
+  geom_smooth(method = "lm")
+
+ggsave("The effect of the minimum stay on price.jpg")
+  
+
+
+
+
+# This correlation matrix is useful in identifying multicollinearity
+# There are some correlated predictors but they are not excessively correlated
+
+
+berlin_condensed %>%
+  select(-c(price)) %>%
+  pairs.panels(stars = T)
+
+```
+
+
+# split data into training and testing set
+
+```{r}
+berlin_split <- berlin_condensed %>% 
+  initial_split(prop = 3/4)
+
+berlin_train <- training(berlin_split)
+berlin_test <- testing(berlin_split)
+
+```
+
+# Models
+
+# The traditional way of iteratively building up a  regression model. Start with a Null and build up. 
+# Although the BIC does decrease up to model 5, model 5 has a major problem with multicolinearity. Model 4 is not better than model 3
+# so we will settle with Model 3 which has a multiple R squared of 0.4811. This means that roughly 48% of the variance in price can
+# be explained by the predictors
+
+```{r}
+
+
+train_model1 <- lm(price_log ~ 1, data = berlin_train)
+
+train_model2 <- lm(price_log ~ neighbourhood_group_cleansed + room_type +
+                    minimum_nights + beds + accommodates , data = berlin_train)
+
+
+train_model3 <- lm(price_log ~ neighbourhood_group_cleansed + room_type +
+                    minimum_nights + beds + accommodates + bathrooms  , data = berlin_train)
+
+train_model4 <- lm(price_log ~ neighbourhood_group_cleansed + room_type +
+                    minimum_nights + accommodates + bathrooms  , data = berlin_train)
+
+train_model5 <- lm(price_log ~ neighbourhood_group_cleansed + room_type +
+                    minimum_nights + accommodates + bathrooms + property_type, data = berlin_train)
+
+
+
+anova(train_model1, train_model2, train_model3,
+      train_model4, train_model5)
+
+
+
+BIC(train_model1)
+BIC(train_model2)
+BIC(train_model3)
+BIC(train_model4)
+BIC(train_model5)
+
+
+summary(train_model3)
+summary(train_model5)
+
+
+
+```
+
+
+
+# create diagnostic plots
+
+```{r}
+par(mfrow = c(2,2))
+plot(train_model3)
+```
+
+
+# I will use the equation for model 3 in a newer method using tidymodels (as per Julia Silge's demonstration on NFL data)
+
+
+```{r}
+lm_specification <- linear_reg() %>% 
+  set_engine(engine = "lm")
+
+lm_fit <- lm_specification %>% 
+  fit(price_log ~ neighbourhood_group_cleansed + room_type +
+                    minimum_nights + beds + accommodates + bathrooms  , data = berlin_train)
+```
+
+
+# Model evaluation 
+
+```{r}
+traning_results <- lm_fit %>% 
+  predict(new_data = berlin_train) %>% 
+  mutate(true_values = berlin_train$price_log)
+
+test_results <- lm_fit %>% 
+  predict(new_data = berlin_test) %>% 
+  mutate(true_values = berlin_test$price_log)
+```
+
+# Calculate root mean square error between testing and training data - 
+# training RMSE = 0.4252788
+# Test RMSE = 0.4230923
+
+```{r}
+traning_results %>% 
+  rmse(truth = true_values, estimate = .pred)
+
+test_results %>% 
+  rmse(truth = true_values, estimate = .pred)
+
+```
+# Calculate Mean Absolute Percentage Error for the linear regression model -
+
+MAPE for training - 8.691422
+MAPE for test - 8.716036
+
+```{r}
+traning_results %>% 
+  mape(truth = true_values, estimate = .pred)
+
+test_results %>% 
+  mape(truth = true_values, estimate = .pred)
+```
+
+
+
+# Try a random forest model with the same equation to see if it predicts the price better than the linear mutliple regression
+# This model does not seem to perform as well as the linear regression
+
+```{r}
+
+rf_specification <- rand_forest(mode = "regression") %>%
+  set_engine("ranger")
+
+rf_fit <- rf_specification %>% 
+  fit(price_log ~ neighbourhood_group_cleansed + room_type +
+                    minimum_nights + beds + accommodates + bathrooms  , data = berlin_train)
+  
+traning_results_rf <- rf_fit %>% 
+  predict(new_data = berlin_train) %>% 
+  mutate(true_values = berlin_train$price_log)
+
+test_results_rf <- rf_fit %>% 
+  predict(new_data = berlin_test) %>% 
+  mutate(true_values = berlin_test$price_log)
+```
+
+# Calculate root mean square error for random forest training vs test
+
+```{r}
+traning_results_rf %>% 
+  rmse(truth = true_values, estimate = .pred)
+
+test_results_rf %>% 
+  rmse(truth = true_values, estimate = .pred)
+```
+
+#Interpeting model coefficients
+
+```{r}
+tidy(lm_fit) %>% 
+  arrange(desc(estimate))
+```
+
+```{r}
+
+interpret <- function(c){
+  r <- (exp(c)-1) * 100
+  print(r)
+}
+
+interpret(0.1234742374)
+
+
+```
+
+
